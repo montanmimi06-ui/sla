@@ -4,17 +4,25 @@ const admin = require("firebase-admin");
 const app = express();
 app.use(express.json());
 
-const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
+try {
+  const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
 
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-});
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+  });
+
+  console.log("🔥 Firebase inicializado");
+} catch (e) {
+  console.error("❌ ERRO FIREBASE:", e);
+}
 
 app.post("/send", async (req, res) => {
   const { token, data } = req.body;
 
+  console.log("📩 RECEBIDO:", token);
+
   try {
-    await admin.messaging().send({
+    const response = await admin.messaging().send({
       token: token,
       notification: {
         title: "Nova notificação 💌",
@@ -23,13 +31,14 @@ app.post("/send", async (req, res) => {
       data: data || {},
     });
 
+    console.log("✅ SUCESSO:", response);
     res.send("Enviado!");
   } catch (err) {
-    console.error(err);
+    console.error("❌ ERRO AO ENVIAR:", err);
     res.status(500).send("Erro ao enviar");
   }
 });
 
 app.listen(3000, () => {
-  console.log("Servidor rodando na porta 3000");
+  console.log("🚀 Servidor rodando");
 });
