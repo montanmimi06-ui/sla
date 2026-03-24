@@ -6,7 +6,7 @@ app.use(express.json());
 
 try {
   const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
-
+  console.log("🔑 private_key:", process.env.FIREBASE_KEY.slice(0, 100));
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
   });
