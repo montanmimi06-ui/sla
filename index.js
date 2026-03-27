@@ -1,76 +1,96 @@
 const express = require("express");
 const admin = require("firebase-admin");
+const multer = require("multer");
+const fs = require("fs");
+const path = require("path");
+const { v2: cloudinary } = require("cloudinary");
 
 const app = express();
 app.use(express.json());
 
-let firebaseReady = false;
+const upload = multer({
+  dest: "tmp/",
+  limits: {
+    fileSize: 15 * 1024 * 1024, // 15MB
+  },
+});
 
+let firebaseReady = false;
+let cloudinaryReady = false;
+
+/* ===========================
+   🔥 FIREBASE INIT
+=========================== */
 try {
   if (!process.env.FIREBASE_KEY) {
     throw new Error("FIREBASE_KEY não definida no ambiente");
   }
 
-  console.log("🔍 FIREBASE_KEY encontrada:", !!process.env.FIREBASE_KEY);
-  console.log("🔍 Tamanho da FIREBASE_KEY:", process.env.FIREBASE_KEY.length);
-
   const raw = JSON.parse(process.env.FIREBASE_KEY);
-
-  if (!raw.private_key) {
-    throw new Error("private_key ausente dentro da FIREBASE_KEY");
-  }
 
   const serviceAccount = {
     ...raw,
     private_key: raw.private_key.replace(/\\n/g, "\n"),
   };
 
-  console.log("🔍 project_id:", serviceAccount.project_id);
-  console.log("🔍 client_email:", serviceAccount.client_email);
-  console.log(
-    "🔍 private_key ok:",
-    serviceAccount.private_key.startsWith("-----BEGIN PRIVATE KEY-----")
-  );
-
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
   });
 
   firebaseReady = true;
-  console.log("🔥 Firebase inicializado com sucesso");
+  console.log("🔥 Firebase inicializado");
 } catch (e) {
-  console.error("❌ ERRO AO INICIALIZAR FIREBASE:");
-  console.error("mensagem:", e.message);
-  console.error("stack:", e.stack);
+  console.error("❌ Firebase erro:", e.message);
 }
 
-app.get("/", (req, res) => {
-  res.send("Servidor online");
-});
+/* ===========================
+   ☁️ CLOUDINARY INIT
+=========================== */
+try {
+  if (
+    !process.env.CLOUDINARY_CLOUD_NAME ||
+    !process.env.CLOUDINARY_API_KEY ||
+    !process.env.CLOUDINARY_API_SECRET
+  ) {
+    throw new Error("Credenciais Cloudinary ausentes");
+  }
 
+  cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET,
+  });
+
+  cloudinaryReady = true;
+  console.log("☁️ Cloudinary inicializada");
+} catch (e) {
+  console.error("❌ Cloudinary erro:", e.message);
+}
+
+/* ===========================
+   🩺 HEALTH CHECK
+=========================== */
 app.get("/health", (req, res) => {
-  res.status(firebaseReady ? 200 : 500).json({
+  res.json({
     server: "ok",
     firebaseReady,
+    cloudinaryReady,
   });
 });
 
+/* ===========================
+   🔔 PUSH NOTIFICATION
+=========================== */
 app.post("/send", async (req, res) => {
   try {
     if (!firebaseReady) {
-      return res.status(500).json({
-        erro: "Firebase não inicializado",
-      });
+      return res.status(500).json({ erro: "Firebase não inicializado" });
     }
 
     const { token, data, title, body } = req.body;
 
-    console.log("📩 BODY RECEBIDO:", JSON.stringify(req.body, null, 2));
-
     if (!token) {
-      return res.status(400).json({
-        erro: "Token ausente",
-      });
+      return res.status(400).json({ erro: "Token ausente" });
     }
 
     const payload = {
@@ -83,36 +103,91 @@ app.post("/send", async (req, res) => {
     };
 
     if (data && typeof data === "object") {
-      for (const [key, value] of Object.entries(data)) {
-        payload.data[key] = String(value);
+      for (const [k, v] of Object.entries(data)) {
+        payload.data[k] = String(v);
       }
     }
 
-    console.log("📨 Enviando para token:", token);
-
     const response = await admin.messaging().send(payload);
 
-    console.log("✅ SUCESSO:", response);
-
-    return res.status(200).json({
-      ok: true,
-      response,
-    });
+    return res.json({ ok: true, response });
   } catch (err) {
-    console.error("❌ ERRO AO ENVIAR:");
-    console.error("message:", err.message);
-    console.error("code:", err.code);
-    console.error("stack:", err.stack);
+    console.error("❌ ERRO PUSH:", err.message);
 
     return res.status(500).json({
       erro: "Erro ao enviar",
       detalhes: err.message,
-      code: err.code || null,
     });
   }
 });
 
+/* ===========================
+   🎙️ UPLOAD AUDIO (STUDIO)
+=========================== */
+app.post("/upload-audio", upload.single("audio"), async (req, res) => {
+  let tempFile = null;
+
+  try {
+    if (!cloudinaryReady) {
+      return res.status(500).json({
+        erro: "Cloudinary não inicializada",
+      });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({
+        erro: "Arquivo não enviado",
+      });
+    }
+
+    tempFile = req.file.path;
+
+    console.log("🎙️ Arquivo recebido:", {
+      name: req.file.originalname,
+      size: req.file.size,
+    });
+
+    const ext =
+      path.extname(req.file.originalname || "").replace(".", "") || "m4a";
+
+    const result = await cloudinary.uploader.upload(tempFile, {
+      resource_type: "video", // áudio entra como video
+      folder: "studio_audio",
+      public_id: "current_audio", // SEMPRE SOBRESCREVE
+      overwrite: true,
+      invalidate: true,
+      format: ext,
+    });
+
+    console.log("☁️ Upload OK:", result.secure_url);
+
+    return res.json({
+      ok: true,
+      audioUrl: result.secure_url,
+      durationSec: result.duration || null,
+      bytes: result.bytes,
+      format: result.format,
+      createdAt: Date.now(),
+    });
+  } catch (err) {
+    console.error("❌ ERRO UPLOAD:", err.message);
+
+    return res.status(500).json({
+      erro: "Erro upload",
+      detalhes: err.message,
+    });
+  } finally {
+    if (tempFile) {
+      fs.unlink(tempFile, () => {});
+    }
+  }
+});
+
+/* ===========================
+   🚀 START SERVER
+=========================== */
 const PORT = process.env.PORT || 3000;
+
 app.listen(PORT, () => {
-  console.log(`🚀 Servidor rodando na porta ${PORT}`);
+  console.log(`🚀 Rodando na porta ${PORT}`);
 });
