@@ -10,51 +10,31 @@ app.use(express.json());
 
 const upload = multer({
   dest: "tmp/",
-  limits: {
-    fileSize: 15 * 1024 * 1024, // 15MB
-  },
+  limits: { fileSize: 15 * 1024 * 1024 },
 });
 
 let firebaseReady = false;
 let cloudinaryReady = false;
 
-/* ===========================
-   🔥 FIREBASE INIT
-=========================== */
+/* 🔥 FIREBASE */
 try {
-  if (!process.env.FIREBASE_KEY) {
-    throw new Error("FIREBASE_KEY não definida no ambiente");
-  }
-
   const raw = JSON.parse(process.env.FIREBASE_KEY);
 
-  const serviceAccount = {
-    ...raw,
-    private_key: raw.private_key.replace(/\\n/g, "\n"),
-  };
-
   admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
+    credential: admin.credential.cert({
+      ...raw,
+      private_key: raw.private_key.replace(/\\n/g, "\n"),
+    }),
   });
 
   firebaseReady = true;
-  console.log("🔥 Firebase inicializado");
+  console.log("🔥 Firebase OK");
 } catch (e) {
   console.error("❌ Firebase erro:", e.message);
 }
 
-/* ===========================
-   ☁️ CLOUDINARY INIT
-=========================== */
+/* ☁️ CLOUDINARY */
 try {
-  if (
-    !process.env.CLOUDINARY_CLOUD_NAME ||
-    !process.env.CLOUDINARY_API_KEY ||
-    !process.env.CLOUDINARY_API_SECRET
-  ) {
-    throw new Error("Credenciais Cloudinary ausentes");
-  }
-
   cloudinary.config({
     cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
     api_key: process.env.CLOUDINARY_API_KEY,
@@ -62,132 +42,75 @@ try {
   });
 
   cloudinaryReady = true;
-  console.log("☁️ Cloudinary inicializada");
+  console.log("☁️ Cloudinary OK");
 } catch (e) {
   console.error("❌ Cloudinary erro:", e.message);
 }
 
-/* ===========================
-   🩺 HEALTH CHECK
-=========================== */
-app.get("/health", (req, res) => {
-  res.json({
-    server: "ok",
-    firebaseReady,
-    cloudinaryReady,
-  });
+/* 🩺 HEALTH */
+app.get("/health", (_, res) => {
+  res.json({ firebaseReady, cloudinaryReady });
 });
 
-/* ===========================
-   🔔 PUSH NOTIFICATION
-=========================== */
+/* 🔔 PUSH */
 app.post("/send", async (req, res) => {
   try {
-    if (!firebaseReady) {
-      return res.status(500).json({ erro: "Firebase não inicializado" });
-    }
+    const { token, title, body, data } = req.body;
 
-    const { token, data, title, body } = req.body;
-
-    if (!token) {
-      return res.status(400).json({ erro: "Token ausente" });
-    }
-
-    const payload = {
+    const msg = {
       token,
       notification: {
-        title: title || "Nova notificação 💌",
-        body: body || "Você recebeu algo",
+        title: title || "Novo áudio 🎤",
+        body: body || "Tem algo novo",
       },
-      data: {},
+      data: Object.fromEntries(
+        Object.entries(data || {}).map(([k, v]) => [k, String(v)])
+      ),
     };
 
-    if (data && typeof data === "object") {
-      for (const [k, v] of Object.entries(data)) {
-        payload.data[k] = String(v);
-      }
-    }
-
-    const response = await admin.messaging().send(payload);
-
-    return res.json({ ok: true, response });
-  } catch (err) {
-    console.error("❌ ERRO PUSH:", err.message);
-
-    return res.status(500).json({
-      erro: "Erro ao enviar",
-      detalhes: err.message,
-    });
+    const r = await admin.messaging().send(msg);
+    res.json({ ok: true, r });
+  } catch (e) {
+    res.status(500).json({ erro: e.message });
   }
 });
 
-/* ===========================
-   🎙️ UPLOAD AUDIO (STUDIO)
-=========================== */
+/* 🎤 UPLOAD */
 app.post("/upload-audio", upload.single("audio"), async (req, res) => {
   let tempFile = null;
 
   try {
-    if (!cloudinaryReady) {
-      return res.status(500).json({
-        erro: "Cloudinary não inicializada",
-      });
-    }
-
     if (!req.file) {
-      return res.status(400).json({
-        erro: "Arquivo não enviado",
-      });
+      return res.status(400).json({ erro: "Sem arquivo" });
     }
 
     tempFile = req.file.path;
 
-    console.log("🎙️ Arquivo recebido:", {
-      name: req.file.originalname,
-      size: req.file.size,
-    });
-
-    const ext =
-      path.extname(req.file.originalname || "").replace(".", "") || "m4a";
-
     const result = await cloudinary.uploader.upload(tempFile, {
-      resource_type: "video", // áudio entra como video
+      resource_type: "auto",
       folder: "studio_audio",
-      public_id: "current_audio", // SEMPRE SOBRESCREVE
+      public_id: "current_audio",
       overwrite: true,
       invalidate: true,
-      format: ext,
+      format: "mp3",
+      audio_codec: "mp3",
+      quality: "auto",
     });
 
-    console.log("☁️ Upload OK:", result.secure_url);
+    const finalUrl = result.secure_url + "?v=" + Date.now();
 
     return res.json({
       ok: true,
-      audioUrl: result.secure_url,
-      durationSec: result.duration || null,
-      bytes: result.bytes,
-      format: result.format,
-      createdAt: Date.now(),
+      audioUrl: finalUrl,
     });
-  } catch (err) {
-    console.error("❌ ERRO UPLOAD:", err.message);
-
-    return res.status(500).json({
-      erro: "Erro upload",
-      detalhes: err.message,
-    });
+  } catch (e) {
+    console.error("❌ upload erro:", e.message);
+    res.status(500).json({ erro: e.message });
   } finally {
-    if (tempFile) {
-      fs.unlink(tempFile, () => {});
-    }
+    if (tempFile) fs.unlink(tempFile, () => {});
   }
 });
 
-/* ===========================
-   🚀 START SERVER
-=========================== */
-const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-  console.log(`🚀 Rodando na porta ${PORT}`);
-});
+app.listen(process.env.PORT || 3000, () =>
+  console.log("🚀 server rodando")
+);
