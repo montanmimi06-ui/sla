@@ -290,7 +290,7 @@ app.post("/pair/join", verifyAuth, async (req, res) => {
 app.post("/send-miss", verifyAuth, async (req, res) => {
   try {
     const uid = req.uid;
-    const { pairId } = req.body || {};
+    const { pairId, location } = req.body || {};
 
     if (!pairId) {
       return res.status(400).json({ erro: "pairId obrigatório." });
@@ -313,12 +313,29 @@ app.post("/send-miss", verifyAuth, async (req, res) => {
 
     const partner = await getUserRecord(partnerUid);
 
+    let safeLocation = null;
+
+    if (user.role === "B" && location && typeof location === "object") {
+      const lat = Number(location.latitude);
+      const lng = Number(location.longitude);
+
+      if (Number.isFinite(lat) && Number.isFinite(lng)) {
+        safeLocation = {
+          latitude: lat,
+          longitude: lng,
+          accuracy: location.accuracy != null ? Number(location.accuracy) : null,
+        };
+      }
+    }
+
     const payload = {
       type: "miss",
       pairId,
       senderId: uid,
       senderRole: user.role,
       time: new Date().toISOString(),
+      hasLocation: !!safeLocation,
+      location: safeLocation,
     };
 
     await db.ref(`pairs/${pairId}/connection/lastMiss`).set(payload);
@@ -327,12 +344,37 @@ app.post("/send-miss", verifyAuth, async (req, res) => {
       await sendPushToToken({
         token: partner.fcmToken,
         title: "Sinto saudades 💗",
-        body: "Alguém apertou o botão da saudade.",
-        data: payload,
+        body:
+          user.role === "B" && safeLocation
+            ? "A saudade chegou com localização."
+            : "Alguém apertou o botão da saudade.",
+        data: {
+          type: payload.type,
+          pairId: payload.pairId,
+          senderId: payload.senderId,
+          senderRole: payload.senderRole,
+          time: payload.time,
+          hasLocation: payload.hasLocation ? "true" : "false",
+          latitude:
+            safeLocation && safeLocation.latitude != null
+              ? String(safeLocation.latitude)
+              : "",
+          longitude:
+            safeLocation && safeLocation.longitude != null
+              ? String(safeLocation.longitude)
+              : "",
+          accuracy:
+            safeLocation && safeLocation.accuracy != null
+              ? String(safeLocation.accuracy)
+              : "",
+        },
       });
     }
 
-    return res.json({ ok: true });
+    return res.json({
+      ok: true,
+      hasLocation: !!safeLocation,
+    });
   } catch (e) {
     console.error("❌ send-miss:", e.message);
     return res.status(500).json({ erro: e.message });
