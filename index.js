@@ -102,8 +102,30 @@ async function getPairRecord(pairId) {
   return snap.val();
 }
 
-async function sendPushToToken({ token, title, body, data = {} }) {
+function buildMergedUser(existingUser = {}, patch = {}, now = Date.now()) {
+  return {
+    ...existingUser,
+    ...patch,
+    createdAt: existingUser.createdAt ?? now,
+    lastSeen: now,
+    status: "active",
+  };
+}
+
+async function sendPushToToken({
+  token,
+  title,
+  body,
+  data = {},
+  channelId = "spotlove_alerts",
+}) {
   if (!token) return null;
+
+  const cleanData = Object.fromEntries(
+    Object.entries(data)
+      .filter(([, v]) => v !== undefined && v !== null)
+      .map(([k, v]) => [k, String(v)])
+  );
 
   const msg = {
     token,
@@ -111,9 +133,15 @@ async function sendPushToToken({ token, title, body, data = {} }) {
       title,
       body,
     },
-    data: Object.fromEntries(
-      Object.entries(data).map(([k, v]) => [k, String(v)])
-    ),
+    data: cleanData,
+    android: {
+      priority: "high",
+      notification: {
+        channelId,
+        clickAction: "FLUTTER_NOTIFICATION_CLICK",
+        sound: "default",
+      },
+    },
   };
 
   return admin.messaging().send(msg);
@@ -162,15 +190,18 @@ app.post("/pair/create", verifyAuth, async (req, res) => {
     const inviteCode = await createUniqueInviteCode();
     const now = Date.now();
 
+    const mergedUser = buildMergedUser(
+      existingUser,
+      {
+        pairId,
+        role: "A",
+        boundDeviceId: deviceId,
+      },
+      now
+    );
+
     const updates = {};
-    updates[`users/${uid}`] = {
-      pairId,
-      role: "A",
-      boundDeviceId: deviceId,
-      createdAt: now,
-      lastSeen: now,
-      status: "active",
-    };
+    updates[`users/${uid}`] = mergedUser;
 
     updates[`pairs/${pairId}`] = {
       createdAt: now,
@@ -218,6 +249,7 @@ app.post("/pair/join", verifyAuth, async (req, res) => {
     }
 
     const existingUser = await getUserRecord(uid);
+
     if (existingUser?.pairId && existingUser?.role && existingUser?.boundDeviceId) {
       if (existingUser.boundDeviceId !== deviceId) {
         return res.status(409).json({
@@ -257,17 +289,19 @@ app.post("/pair/join", verifyAuth, async (req, res) => {
     }
 
     const now = Date.now();
+
+    const mergedUser = buildMergedUser(
+      existingUser,
+      {
+        pairId,
+        role: "B",
+        boundDeviceId: deviceId,
+      },
+      now
+    );
+
     const updates = {};
-
-    updates[`users/${uid}`] = {
-      pairId,
-      role: "B",
-      boundDeviceId: deviceId,
-      createdAt: now,
-      lastSeen: now,
-      status: "active",
-    };
-
+    updates[`users/${uid}`] = mergedUser;
     updates[`pairs/${pairId}/members/B`] = uid;
     updates[`pairInvites/${normalizedCode}/status`] = "used";
     updates[`pairInvites/${normalizedCode}/usedBy`] = uid;
@@ -318,12 +352,14 @@ app.post("/send-miss", verifyAuth, async (req, res) => {
     if (user.role === "B" && location && typeof location === "object") {
       const lat = Number(location.latitude);
       const lng = Number(location.longitude);
+      const accuracy =
+        location.accuracy != null ? Number(location.accuracy) : null;
 
       if (Number.isFinite(lat) && Number.isFinite(lng)) {
         safeLocation = {
           latitude: lat,
           longitude: lng,
-          accuracy: location.accuracy != null ? Number(location.accuracy) : null,
+          accuracy: Number.isFinite(accuracy) ? accuracy : null,
         };
       }
     }
@@ -340,40 +376,46 @@ app.post("/send-miss", verifyAuth, async (req, res) => {
 
     await db.ref(`pairs/${pairId}/connection/lastMiss`).set(payload);
 
-    if (partner?.fcmToken) {
-      await sendPushToToken({
-        token: partner.fcmToken,
-        title: "Sinto saudades 💗",
-        body:
-          user.role === "B" && safeLocation
-            ? "A saudade chegou com localização."
-            : "Alguém apertou o botão da saudade.",
-        data: {
-          type: payload.type,
-          pairId: payload.pairId,
-          senderId: payload.senderId,
-          senderRole: payload.senderRole,
-          time: payload.time,
-          hasLocation: payload.hasLocation ? "true" : "false",
-          latitude:
-            safeLocation && safeLocation.latitude != null
-              ? String(safeLocation.latitude)
-              : "",
-          longitude:
-            safeLocation && safeLocation.longitude != null
-              ? String(safeLocation.longitude)
-              : "",
-          accuracy:
-            safeLocation && safeLocation.accuracy != null
-              ? String(safeLocation.accuracy)
-              : "",
-        },
+    if (!partner?.fcmToken) {
+      return res.status(409).json({
+        erro: "A outra pessoa ainda não registrou notificações neste aparelho.",
       });
     }
+
+    const pushId = await sendPushToToken({
+      token: partner.fcmToken,
+      title: "Sinto saudades 💗",
+      body:
+        user.role === "B" && safeLocation
+          ? "A saudade chegou com localização."
+          : "Alguém apertou o botão da saudade.",
+      channelId: "spotlove_alerts",
+      data: {
+        type: payload.type,
+        pairId: payload.pairId,
+        senderId: payload.senderId,
+        senderRole: payload.senderRole,
+        time: payload.time,
+        hasLocation: payload.hasLocation ? "true" : "false",
+        latitude:
+          safeLocation && safeLocation.latitude != null
+            ? String(safeLocation.latitude)
+            : "",
+        longitude:
+          safeLocation && safeLocation.longitude != null
+            ? String(safeLocation.longitude)
+            : "",
+        accuracy:
+          safeLocation && safeLocation.accuracy != null
+            ? String(safeLocation.accuracy)
+            : "",
+      },
+    });
 
     return res.json({
       ok: true,
       hasLocation: !!safeLocation,
+      pushId,
     });
   } catch (e) {
     console.error("❌ send-miss:", e.message);
@@ -383,12 +425,13 @@ app.post("/send-miss", verifyAuth, async (req, res) => {
 
 app.post("/send", async (req, res) => {
   try {
-    const { token, title, body, data } = req.body;
+    const { token, title, body, data } = req.body || {};
 
     const r = await sendPushToToken({
       token,
       title: title || "Novo áudio 🎤",
       body: body || "Tem algo novo",
+      channelId: "spotlove_alerts",
       data: data || {},
     });
 
@@ -456,6 +499,7 @@ app.post("/upload-audio", verifyAuth, upload.single("audio"), async (req, res) =
         token: partner.fcmToken,
         title: "Novo áudio 🎤",
         body: "Tem algo novo no estúdio.",
+        channelId: "spotlove_alerts",
         data: {
           type: "studio_audio",
           pairId,
