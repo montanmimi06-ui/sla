@@ -34,7 +34,6 @@ try {
       private_key: raw.private_key.replace(/\\n/g, "\n"),
     }),
     databaseURL: process.env.FIREBASE_DATABASE_URL,
-    storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
   });
 
   db = admin.database();
@@ -334,7 +333,7 @@ app.post("/admin/app-version", verifyAdminSecret, async (req, res) => {
         typeof message === "string" && message.trim()
           ? message.trim()
           : "Tem uma atualização nova do SpotLove disponível.",
-      forceUpdate: forceUpdate === true,
+      forceUpdate: forceUpdate === true || forceUpdate === "true",
       updatedAt: new Date().toISOString(),
     };
 
@@ -354,7 +353,7 @@ app.post("/admin/app-version", verifyAdminSecret, async (req, res) => {
 });
 
 /**
- * ADMIN — UPLOAD AUTOMÁTICO DO APK + ATUALIZAÇÃO DO FIREBASE
+ * ADMIN — UPLOAD AUTOMÁTICO DO APK NO CLOUDINARY + FIREBASE CONFIG
  */
 app.post(
   "/admin/upload-apk-release",
@@ -366,9 +365,9 @@ app.post(
     try {
       if (!requireFirebase(res)) return;
 
-      if (!process.env.FIREBASE_STORAGE_BUCKET) {
+      if (!cloudinaryReady) {
         return res.status(500).json({
-          erro: "FIREBASE_STORAGE_BUCKET não configurado.",
+          erro: "Cloudinary não inicializado.",
         });
       }
 
@@ -394,27 +393,20 @@ app.post(
 
       tempFile = req.file.path;
 
-      const bucket = admin.storage().bucket();
       const cleanVersion = latestVersion.trim();
-      const token = crypto.randomUUID();
+      const uniqueId = crypto.randomUUID();
 
-      const destination = `releases/android/spotlove-${cleanVersion}-${Date.now()}.apk`;
+      const publicId = `spotlove_releases/android/spotlove-${cleanVersion}-${uniqueId}.apk`;
 
-      await bucket.upload(tempFile, {
-        destination,
-        metadata: {
-          contentType: "application/vnd.android.package-archive",
-          metadata: {
-            firebaseStorageDownloadTokens: token,
-          },
-        },
+      const result = await cloudinary.uploader.upload(tempFile, {
+        resource_type: "raw",
+        public_id: publicId,
+        overwrite: true,
+        use_filename: false,
+        unique_filename: false,
       });
 
-      const encodedPath = encodeURIComponent(destination);
-
-      const updateUrl =
-        `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodedPath}` +
-        `?alt=media&token=${token}`;
+      const updateUrl = result.secure_url;
 
       const payload = {
         latestVersion: cleanVersion,
@@ -432,6 +424,9 @@ app.post(
             ? message.trim()
             : `A versão ${cleanVersion} do SpotLove está disponível.`,
         forceUpdate: forceUpdate === "true" || forceUpdate === true,
+        provider: "cloudinary",
+        cloudinaryPublicId: result.public_id,
+        cloudinaryResourceType: result.resource_type,
         updatedAt: new Date().toISOString(),
       };
 
@@ -439,8 +434,9 @@ app.post(
 
       return res.json({
         ok: true,
-        apkPath: destination,
+        provider: "cloudinary",
         updateUrl,
+        cloudinaryPublicId: result.public_id,
         appConfig: payload,
       });
     } catch (e) {
