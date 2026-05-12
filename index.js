@@ -2,7 +2,6 @@ const express = require("express");
 const admin = require("firebase-admin");
 const multer = require("multer");
 const fs = require("fs");
-const crypto = require("crypto");
 const { v2: cloudinary } = require("cloudinary");
 
 const app = express();
@@ -14,11 +13,6 @@ fs.mkdirSync("tmp", { recursive: true });
 const audioUpload = multer({
   dest: "tmp/",
   limits: { fileSize: 15 * 1024 * 1024 },
-});
-
-const apkUpload = multer({
-  dest: "tmp/",
-  limits: { fileSize: 250 * 1024 * 1024 },
 });
 
 let firebaseReady = false;
@@ -291,7 +285,9 @@ function letterPushBody(intensity) {
 }
 
 /**
- * ADMIN — PUBLICAR CONFIGURAÇÃO DE VERSÃO MANUALMENTE
+ * ADMIN — PUBLICAR VERSÃO DO APP
+ * O APK fica no GitHub Releases.
+ * O Firebase guarda apenas a versão e o link.
  */
 app.post("/admin/app-version", verifyAdminSecret, async (req, res) => {
   try {
@@ -304,6 +300,10 @@ app.post("/admin/app-version", verifyAdminSecret, async (req, res) => {
       title,
       message,
       forceUpdate,
+      provider,
+      githubReleaseUrl,
+      githubTag,
+      assetName,
     } = req.body || {};
 
     if (!latestVersion || typeof latestVersion !== "string") {
@@ -334,6 +334,10 @@ app.post("/admin/app-version", verifyAdminSecret, async (req, res) => {
           ? message.trim()
           : "Tem uma atualização nova do SpotLove disponível.",
       forceUpdate: forceUpdate === true || forceUpdate === "true",
+      provider: provider || "github",
+      githubReleaseUrl: githubReleaseUrl || null,
+      githubTag: githubTag || null,
+      assetName: assetName || null,
       updatedAt: new Date().toISOString(),
     };
 
@@ -351,107 +355,6 @@ app.post("/admin/app-version", verifyAdminSecret, async (req, res) => {
     });
   }
 });
-
-/**
- * ADMIN — UPLOAD AUTOMÁTICO DO APK NO CLOUDINARY + FIREBASE CONFIG
- */
-app.post(
-  "/admin/upload-apk-release",
-  verifyAdminSecret,
-  apkUpload.single("apk"),
-  async (req, res) => {
-    let tempFile = null;
-
-    try {
-      if (!requireFirebase(res)) return;
-
-      if (!cloudinaryReady) {
-        return res.status(500).json({
-          erro: "Cloudinary não inicializado.",
-        });
-      }
-
-      if (!req.file) {
-        return res.status(400).json({
-          erro: "Arquivo APK obrigatório.",
-        });
-      }
-
-      const {
-        latestVersion,
-        minRequiredVersion,
-        title,
-        message,
-        forceUpdate,
-      } = req.body || {};
-
-      if (!latestVersion || typeof latestVersion !== "string") {
-        return res.status(400).json({
-          erro: "latestVersion obrigatório.",
-        });
-      }
-
-      tempFile = req.file.path;
-
-      const cleanVersion = latestVersion.trim();
-      const uniqueId = crypto.randomUUID();
-
-      const publicId = `spotlove_releases/android/spotlove-${cleanVersion}-${uniqueId}.apk`;
-
-      const result = await cloudinary.uploader.upload(tempFile, {
-        resource_type: "raw",
-        public_id: publicId,
-        overwrite: true,
-        use_filename: false,
-        unique_filename: false,
-      });
-
-      const updateUrl = result.secure_url;
-
-      const payload = {
-        latestVersion: cleanVersion,
-        minRequiredVersion:
-          typeof minRequiredVersion === "string" && minRequiredVersion.trim()
-            ? minRequiredVersion.trim()
-            : "1.0.0",
-        updateUrl,
-        title:
-          typeof title === "string" && title.trim()
-            ? title.trim()
-            : "Nova versão disponível 💗",
-        message:
-          typeof message === "string" && message.trim()
-            ? message.trim()
-            : `A versão ${cleanVersion} do SpotLove está disponível.`,
-        forceUpdate: forceUpdate === "true" || forceUpdate === true,
-        provider: "cloudinary",
-        cloudinaryPublicId: result.public_id,
-        cloudinaryResourceType: result.resource_type,
-        updatedAt: new Date().toISOString(),
-      };
-
-      await db.ref("appConfig/android").update(payload);
-
-      return res.json({
-        ok: true,
-        provider: "cloudinary",
-        updateUrl,
-        cloudinaryPublicId: result.public_id,
-        appConfig: payload,
-      });
-    } catch (e) {
-      console.error("❌ upload-apk-release:", e.message);
-
-      return res.status(500).json({
-        erro: e.message,
-      });
-    } finally {
-      if (tempFile) {
-        fs.unlink(tempFile, () => {});
-      }
-    }
-  }
-);
 
 /**
  * CRIAR VÍNCULO
@@ -985,6 +888,8 @@ app.post("/send", verifyAuth, async (req, res) => {
 
 /**
  * UPLOAD DO ÁUDIO DO STUDIO
+ * Cloudinary permanece aqui apenas se você ainda usa o Studio para áudio.
+ * O APK NÃO usa Cloudinary.
  */
 app.post(
   "/upload-audio",
