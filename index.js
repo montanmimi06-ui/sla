@@ -17,6 +17,7 @@ const upload = multer({
 
 let firebaseReady = false;
 let cloudinaryReady = false;
+let db = null;
 
 try {
   const raw = JSON.parse(process.env.FIREBASE_KEY);
@@ -29,7 +30,9 @@ try {
     databaseURL: process.env.FIREBASE_DATABASE_URL,
   });
 
+  db = admin.database();
   firebaseReady = true;
+
   console.log("🔥 Firebase OK");
 } catch (e) {
   console.error("❌ Firebase erro:", e.message);
@@ -48,8 +51,6 @@ try {
   console.error("❌ Cloudinary erro:", e.message);
 }
 
-const db = firebaseReady ? admin.database() : null;
-
 app.get("/health", (_, res) => {
   res.json({
     ok: true,
@@ -60,7 +61,9 @@ app.get("/health", (_, res) => {
 
 function requireFirebase(res) {
   if (!firebaseReady || !db) {
-    res.status(500).json({ erro: "Firebase não inicializado." });
+    res.status(500).json({
+      erro: "Firebase não inicializado.",
+    });
     return false;
   }
 
@@ -74,7 +77,9 @@ async function verifyAuth(req, res, next) {
     const authHeader = req.headers.authorization || "";
 
     if (!authHeader.startsWith("Bearer ")) {
-      return res.status(401).json({ erro: "Token ausente." });
+      return res.status(401).json({
+        erro: "Token ausente.",
+      });
     }
 
     const idToken = authHeader.slice(7);
@@ -83,8 +88,28 @@ async function verifyAuth(req, res, next) {
     req.uid = decoded.uid;
     next();
   } catch (e) {
-    return res.status(401).json({ erro: "Token inválido." });
+    return res.status(401).json({
+      erro: "Token inválido.",
+    });
   }
+}
+
+function verifyAdminSecret(req, res, next) {
+  const secret = req.headers["x-admin-secret"];
+
+  if (!process.env.ADMIN_UPDATE_SECRET) {
+    return res.status(500).json({
+      erro: "ADMIN_UPDATE_SECRET não configurado no servidor.",
+    });
+  }
+
+  if (secret !== process.env.ADMIN_UPDATE_SECRET) {
+    return res.status(403).json({
+      erro: "Acesso administrativo negado.",
+    });
+  }
+
+  next();
 }
 
 function randomPairId() {
@@ -198,12 +223,14 @@ function resolvePartnerUid(user, pair) {
 
 function validateLetterPayload({ type, style, intensity, text }) {
   const allowedTypes = ["saudade", "promessa", "boa_noite", "surpresa"];
+
   const allowedStyles = [
     "rose_letter",
     "purple_night",
     "blue_envelope",
     "secret_glow",
   ];
+
   const allowedIntensities = ["suave", "profunda", "secreta"];
 
   const cleanText = safeString(text, 800);
@@ -258,6 +285,68 @@ function letterPushBody(intensity) {
 }
 
 /**
+ * ADMIN — PUBLICAR NOVA VERSÃO DO APP
+ */
+app.post("/admin/app-version", verifyAdminSecret, async (req, res) => {
+  try {
+    if (!requireFirebase(res)) return;
+
+    const {
+      latestVersion,
+      minRequiredVersion,
+      updateUrl,
+      title,
+      message,
+      forceUpdate,
+    } = req.body || {};
+
+    if (!latestVersion || typeof latestVersion !== "string") {
+      return res.status(400).json({
+        erro: "latestVersion obrigatório.",
+      });
+    }
+
+    if (!updateUrl || typeof updateUrl !== "string") {
+      return res.status(400).json({
+        erro: "updateUrl obrigatório.",
+      });
+    }
+
+    const payload = {
+      latestVersion: latestVersion.trim(),
+      minRequiredVersion:
+        typeof minRequiredVersion === "string" && minRequiredVersion.trim()
+          ? minRequiredVersion.trim()
+          : "1.0.0",
+      updateUrl: updateUrl.trim(),
+      title:
+        typeof title === "string" && title.trim()
+          ? title.trim()
+          : "Nova versão disponível 💗",
+      message:
+        typeof message === "string" && message.trim()
+          ? message.trim()
+          : "Tem uma atualização nova do SpotLove disponível.",
+      forceUpdate: forceUpdate === true,
+      updatedAt: new Date().toISOString(),
+    };
+
+    await db.ref("appConfig/android").update(payload);
+
+    return res.json({
+      ok: true,
+      appConfig: payload,
+    });
+  } catch (e) {
+    console.error("❌ admin/app-version:", e.message);
+
+    return res.status(500).json({
+      erro: e.message,
+    });
+  }
+});
+
+/**
  * CRIAR VÍNCULO
  */
 app.post("/pair/create", verifyAuth, async (req, res) => {
@@ -266,7 +355,9 @@ app.post("/pair/create", verifyAuth, async (req, res) => {
     const { deviceId } = req.body || {};
 
     if (!deviceId || typeof deviceId !== "string") {
-      return res.status(400).json({ erro: "deviceId obrigatório." });
+      return res.status(400).json({
+        erro: "deviceId obrigatório.",
+      });
     }
 
     const existingUser = await getUserRecord(uid);
@@ -338,7 +429,10 @@ app.post("/pair/create", verifyAuth, async (req, res) => {
     });
   } catch (e) {
     console.error("❌ pair/create:", e.message);
-    return res.status(500).json({ erro: e.message });
+
+    return res.status(500).json({
+      erro: e.message,
+    });
   }
 });
 
@@ -351,13 +445,17 @@ app.post("/pair/join", verifyAuth, async (req, res) => {
     const { deviceId, code } = req.body || {};
 
     if (!deviceId || typeof deviceId !== "string") {
-      return res.status(400).json({ erro: "deviceId obrigatório." });
+      return res.status(400).json({
+        erro: "deviceId obrigatório.",
+      });
     }
 
     const normalizedCode = String(code || "").trim().toUpperCase();
 
     if (!normalizedCode) {
-      return res.status(400).json({ erro: "Código obrigatório." });
+      return res.status(400).json({
+        erro: "Código obrigatório.",
+      });
     }
 
     const existingUser = await getUserRecord(uid);
@@ -381,7 +479,9 @@ app.post("/pair/join", verifyAuth, async (req, res) => {
     const inviteSnap = await db.ref(`pairInvites/${normalizedCode}`).get();
 
     if (!inviteSnap.exists()) {
-      return res.status(404).json({ erro: "Código não encontrado." });
+      return res.status(404).json({
+        erro: "Código não encontrado.",
+      });
     }
 
     const invite = inviteSnap.val();
@@ -396,7 +496,9 @@ app.post("/pair/join", verifyAuth, async (req, res) => {
     const pair = await getPairRecord(pairId);
 
     if (!pair || !pair.members || !pair.members.A) {
-      return res.status(400).json({ erro: "Vínculo inválido." });
+      return res.status(400).json({
+        erro: "Vínculo inválido.",
+      });
     }
 
     if (pair.members.B) {
@@ -441,7 +543,10 @@ app.post("/pair/join", verifyAuth, async (req, res) => {
     });
   } catch (e) {
     console.error("❌ pair/join:", e.message);
-    return res.status(500).json({ erro: e.message });
+
+    return res.status(500).json({
+      erro: e.message,
+    });
   }
 });
 
@@ -454,7 +559,9 @@ app.post("/send-miss", verifyAuth, async (req, res) => {
     const { pairId, location } = req.body || {};
 
     if (!pairId) {
-      return res.status(400).json({ erro: "pairId obrigatório." });
+      return res.status(400).json({
+        erro: "pairId obrigatório.",
+      });
     }
 
     const user = await resolveIdentity(uid);
@@ -468,7 +575,9 @@ app.post("/send-miss", verifyAuth, async (req, res) => {
     const pair = await getPairRecord(pairId);
 
     if (!pair?.members) {
-      return res.status(400).json({ erro: "Vínculo inválido." });
+      return res.status(400).json({
+        erro: "Vínculo inválido.",
+      });
     }
 
     const partnerUid = resolvePartnerUid(user, pair);
@@ -553,7 +662,10 @@ app.post("/send-miss", verifyAuth, async (req, res) => {
     });
   } catch (e) {
     console.error("❌ send-miss:", e.message);
-    return res.status(500).json({ erro: e.message });
+
+    return res.status(500).json({
+      erro: e.message,
+    });
   }
 });
 
@@ -566,7 +678,9 @@ app.post("/send-letter", verifyAuth, async (req, res) => {
     const { pairId, type, style, intensity, text } = req.body || {};
 
     if (!pairId || typeof pairId !== "string") {
-      return res.status(400).json({ erro: "pairId obrigatório." });
+      return res.status(400).json({
+        erro: "pairId obrigatório.",
+      });
     }
 
     const validation = validateLetterPayload({
@@ -577,7 +691,9 @@ app.post("/send-letter", verifyAuth, async (req, res) => {
     });
 
     if (!validation.ok) {
-      return res.status(400).json({ erro: validation.erro });
+      return res.status(400).json({
+        erro: validation.erro,
+      });
     }
 
     const user = await resolveIdentity(uid);
@@ -591,7 +707,9 @@ app.post("/send-letter", verifyAuth, async (req, res) => {
     const pair = await getPairRecord(pairId);
 
     if (!pair?.members) {
-      return res.status(400).json({ erro: "Vínculo inválido." });
+      return res.status(400).json({
+        erro: "Vínculo inválido.",
+      });
     }
 
     const partnerUid = resolvePartnerUid(user, pair);
@@ -652,15 +770,15 @@ app.post("/send-letter", verifyAuth, async (req, res) => {
     });
   } catch (e) {
     console.error("❌ send-letter:", e.message);
-    return res.status(500).json({ erro: e.message });
+
+    return res.status(500).json({
+      erro: e.message,
+    });
   }
 });
 
 /**
  * ABRIR CARTA
- * Rota opcional mais segura do que atualizar openedByPartner direto pelo app.
- * Seu Flutter atual ainda atualiza direto no Realtime Database.
- * Se quiser, depois eu te passo o ajuste da CartaVivaScreen para usar essa rota.
  */
 app.post("/open-letter", verifyAuth, async (req, res) => {
   try {
@@ -668,7 +786,9 @@ app.post("/open-letter", verifyAuth, async (req, res) => {
     const { pairId, letterId } = req.body || {};
 
     if (!pairId || typeof pairId !== "string") {
-      return res.status(400).json({ erro: "pairId obrigatório." });
+      return res.status(400).json({
+        erro: "pairId obrigatório.",
+      });
     }
 
     const user = await resolveIdentity(uid);
@@ -682,13 +802,17 @@ app.post("/open-letter", verifyAuth, async (req, res) => {
     const pair = await getPairRecord(pairId);
 
     if (!pair?.members) {
-      return res.status(400).json({ erro: "Vínculo inválido." });
+      return res.status(400).json({
+        erro: "Vínculo inválido.",
+      });
     }
 
     const letterSnap = await db.ref(`pairs/${pairId}/letters/current`).get();
 
     if (!letterSnap.exists()) {
-      return res.status(404).json({ erro: "Nenhuma carta ativa encontrada." });
+      return res.status(404).json({
+        erro: "Nenhuma carta ativa encontrada.",
+      });
     }
 
     const letter = letterSnap.val();
@@ -701,7 +825,7 @@ app.post("/open-letter", verifyAuth, async (req, res) => {
 
     if (letter.senderId === uid) {
       return res.status(403).json({
-        erro: "O remetente não pode marcar a própria carta como aberta pelo parceiro.",
+        erro: "O remetente não pode abrir a própria carta como parceiro.",
       });
     }
 
@@ -719,13 +843,15 @@ app.post("/open-letter", verifyAuth, async (req, res) => {
     });
   } catch (e) {
     console.error("❌ open-letter:", e.message);
-    return res.status(500).json({ erro: e.message });
+
+    return res.status(500).json({
+      erro: e.message,
+    });
   }
 });
 
 /**
- * ENVIO DE PUSH MANUAL
- * Use só para teste. Está protegido com token Firebase.
+ * PUSH MANUAL DE TESTE
  */
 app.post("/send", verifyAuth, async (req, res) => {
   try {
@@ -744,7 +870,9 @@ app.post("/send", verifyAuth, async (req, res) => {
       r,
     });
   } catch (e) {
-    return res.status(500).json({ erro: e.message });
+    return res.status(500).json({
+      erro: e.message,
+    });
   }
 });
 
@@ -756,18 +884,24 @@ app.post("/upload-audio", verifyAuth, upload.single("audio"), async (req, res) =
 
   try {
     if (!cloudinaryReady) {
-      return res.status(500).json({ erro: "Cloudinary não inicializado." });
+      return res.status(500).json({
+        erro: "Cloudinary não inicializado.",
+      });
     }
 
     const uid = req.uid;
     const { pairId } = req.body || {};
 
     if (!req.file) {
-      return res.status(400).json({ erro: "Sem arquivo." });
+      return res.status(400).json({
+        erro: "Sem arquivo.",
+      });
     }
 
     if (!pairId) {
-      return res.status(400).json({ erro: "pairId obrigatório." });
+      return res.status(400).json({
+        erro: "pairId obrigatório.",
+      });
     }
 
     tempFile = req.file.path;
@@ -783,7 +917,9 @@ app.post("/upload-audio", verifyAuth, upload.single("audio"), async (req, res) =
     const pair = await getPairRecord(pairId);
 
     if (!pair?.members) {
-      return res.status(400).json({ erro: "Vínculo inválido." });
+      return res.status(400).json({
+        erro: "Vínculo inválido.",
+      });
     }
 
     const partnerUid = resolvePartnerUid(user, pair);
@@ -835,7 +971,10 @@ app.post("/upload-audio", verifyAuth, upload.single("audio"), async (req, res) =
     });
   } catch (e) {
     console.error("❌ upload erro:", e.message);
-    return res.status(500).json({ erro: e.message });
+
+    return res.status(500).json({
+      erro: e.message,
+    });
   } finally {
     if (tempFile) {
       fs.unlink(tempFile, () => {});
