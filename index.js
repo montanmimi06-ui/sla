@@ -5,7 +5,10 @@ const fs = require("fs");
 const { v2: cloudinary } = require("cloudinary");
 
 const app = express();
-app.use(express.json());
+
+app.use(express.json({ limit: "1mb" }));
+
+fs.mkdirSync("tmp", { recursive: true });
 
 const upload = multer({
   dest: "tmp/",
@@ -45,14 +48,29 @@ try {
   console.error("❌ Cloudinary erro:", e.message);
 }
 
-const db = admin.database();
+const db = firebaseReady ? admin.database() : null;
 
 app.get("/health", (_, res) => {
-  res.json({ firebaseReady, cloudinaryReady });
+  res.json({
+    ok: true,
+    firebaseReady,
+    cloudinaryReady,
+  });
 });
+
+function requireFirebase(res) {
+  if (!firebaseReady || !db) {
+    res.status(500).json({ erro: "Firebase não inicializado." });
+    return false;
+  }
+
+  return true;
+}
 
 async function verifyAuth(req, res, next) {
   try {
+    if (!requireFirebase(res)) return;
+
     const authHeader = req.headers.authorization || "";
 
     if (!authHeader.startsWith("Bearer ")) {
@@ -73,12 +91,18 @@ function randomPairId() {
   return `pair_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function randomLetterId() {
+  return `letter_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
 function generateInviteCode(size = 6) {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   let out = "";
+
   for (let i = 0; i < size; i++) {
     out += chars[Math.floor(Math.random() * chars.length)];
   }
+
   return out;
 }
 
@@ -86,19 +110,24 @@ async function createUniqueInviteCode() {
   while (true) {
     const code = generateInviteCode(6);
     const snap = await db.ref(`pairInvites/${code}`).get();
+
     if (!snap.exists()) return code;
   }
 }
 
 async function getUserRecord(uid) {
   const snap = await db.ref(`users/${uid}`).get();
+
   if (!snap.exists()) return null;
+
   return snap.val();
 }
 
 async function getPairRecord(pairId) {
   const snap = await db.ref(`pairs/${pairId}`).get();
+
   if (!snap.exists()) return null;
+
   return snap.val();
 }
 
@@ -110,6 +139,10 @@ function buildMergedUser(existingUser = {}, patch = {}, now = Date.now()) {
     lastSeen: now,
     status: "active",
   };
+}
+
+function safeString(value, max = 1000) {
+  return String(value || "").trim().slice(0, max);
 }
 
 async function sendPushToToken({
@@ -157,6 +190,76 @@ async function resolveIdentity(uid) {
   return user;
 }
 
+function resolvePartnerUid(user, pair) {
+  if (!user || !pair?.members) return null;
+
+  return user.role === "A" ? pair.members.B : pair.members.A;
+}
+
+function validateLetterPayload({ type, style, intensity, text }) {
+  const allowedTypes = ["saudade", "promessa", "boa_noite", "surpresa"];
+  const allowedStyles = [
+    "rose_letter",
+    "purple_night",
+    "blue_envelope",
+    "secret_glow",
+  ];
+  const allowedIntensities = ["suave", "profunda", "secreta"];
+
+  const cleanText = safeString(text, 800);
+
+  if (!cleanText) {
+    return {
+      ok: false,
+      erro: "Texto da carta obrigatório.",
+    };
+  }
+
+  if (cleanText.length > 800) {
+    return {
+      ok: false,
+      erro: "A carta deve ter no máximo 800 caracteres.",
+    };
+  }
+
+  return {
+    ok: true,
+    type: allowedTypes.includes(type) ? type : "saudade",
+    style: allowedStyles.includes(style) ? style : "rose_letter",
+    intensity: allowedIntensities.includes(intensity) ? intensity : "suave",
+    text: cleanText,
+  };
+}
+
+function letterPushTitle(type) {
+  switch (type) {
+    case "promessa":
+      return "Uma promessa apareceu";
+    case "boa_noite":
+      return "Uma carta de boa noite chegou";
+    case "surpresa":
+      return "Tem uma surpresa no espaço de vocês";
+    case "saudade":
+    default:
+      return "Uma carta de saudade chegou";
+  }
+}
+
+function letterPushBody(intensity) {
+  switch (intensity) {
+    case "profunda":
+      return "Ela veio com algo que precisava chegar.";
+    case "secreta":
+      return "Só o seu lado pode abrir.";
+    case "suave":
+    default:
+      return "O espaço de vocês acendeu.";
+  }
+}
+
+/**
+ * CRIAR VÍNCULO
+ */
 app.post("/pair/create", verifyAuth, async (req, res) => {
   try {
     const uid = req.uid;
@@ -168,7 +271,11 @@ app.post("/pair/create", verifyAuth, async (req, res) => {
 
     const existingUser = await getUserRecord(uid);
 
-    if (existingUser?.pairId && existingUser?.role && existingUser?.boundDeviceId) {
+    if (
+      existingUser?.pairId &&
+      existingUser?.role &&
+      existingUser?.boundDeviceId
+    ) {
       if (existingUser.boundDeviceId !== deviceId) {
         return res.status(409).json({
           erro: "Esta conta já está vinculada a outro aparelho.",
@@ -201,6 +308,7 @@ app.post("/pair/create", verifyAuth, async (req, res) => {
     );
 
     const updates = {};
+
     updates[`users/${uid}`] = mergedUser;
 
     updates[`pairs/${pairId}`] = {
@@ -234,6 +342,9 @@ app.post("/pair/create", verifyAuth, async (req, res) => {
   }
 });
 
+/**
+ * ENTRAR NO VÍNCULO
+ */
 app.post("/pair/join", verifyAuth, async (req, res) => {
   try {
     const uid = req.uid;
@@ -244,13 +355,18 @@ app.post("/pair/join", verifyAuth, async (req, res) => {
     }
 
     const normalizedCode = String(code || "").trim().toUpperCase();
+
     if (!normalizedCode) {
       return res.status(400).json({ erro: "Código obrigatório." });
     }
 
     const existingUser = await getUserRecord(uid);
 
-    if (existingUser?.pairId && existingUser?.role && existingUser?.boundDeviceId) {
+    if (
+      existingUser?.pairId &&
+      existingUser?.role &&
+      existingUser?.boundDeviceId
+    ) {
       if (existingUser.boundDeviceId !== deviceId) {
         return res.status(409).json({
           erro: "Esta conta já está vinculada a outro aparelho.",
@@ -263,6 +379,7 @@ app.post("/pair/join", verifyAuth, async (req, res) => {
     }
 
     const inviteSnap = await db.ref(`pairInvites/${normalizedCode}`).get();
+
     if (!inviteSnap.exists()) {
       return res.status(404).json({ erro: "Código não encontrado." });
     }
@@ -270,7 +387,9 @@ app.post("/pair/join", verifyAuth, async (req, res) => {
     const invite = inviteSnap.val();
 
     if (invite.status !== "pending") {
-      return res.status(409).json({ erro: "Esse código não está mais disponível." });
+      return res.status(409).json({
+        erro: "Esse código não está mais disponível.",
+      });
     }
 
     const pairId = invite.pairId;
@@ -281,11 +400,15 @@ app.post("/pair/join", verifyAuth, async (req, res) => {
     }
 
     if (pair.members.B) {
-      return res.status(409).json({ erro: "Esse vínculo já está completo." });
+      return res.status(409).json({
+        erro: "Esse vínculo já está completo.",
+      });
     }
 
     if (pair.members.A === uid) {
-      return res.status(409).json({ erro: "Você não pode entrar no próprio código." });
+      return res.status(409).json({
+        erro: "Você não pode entrar no próprio código.",
+      });
     }
 
     const now = Date.now();
@@ -301,6 +424,7 @@ app.post("/pair/join", verifyAuth, async (req, res) => {
     );
 
     const updates = {};
+
     updates[`users/${uid}`] = mergedUser;
     updates[`pairs/${pairId}/members/B`] = uid;
     updates[`pairInvites/${normalizedCode}/status`] = "used";
@@ -321,6 +445,9 @@ app.post("/pair/join", verifyAuth, async (req, res) => {
   }
 });
 
+/**
+ * SAUDADE
+ */
 app.post("/send-miss", verifyAuth, async (req, res) => {
   try {
     const uid = req.uid;
@@ -331,18 +458,25 @@ app.post("/send-miss", verifyAuth, async (req, res) => {
     }
 
     const user = await resolveIdentity(uid);
+
     if (user.pairId !== pairId) {
-      return res.status(403).json({ erro: "Acesso negado a esse vínculo." });
+      return res.status(403).json({
+        erro: "Acesso negado a esse vínculo.",
+      });
     }
 
     const pair = await getPairRecord(pairId);
+
     if (!pair?.members) {
       return res.status(400).json({ erro: "Vínculo inválido." });
     }
 
-    const partnerUid = user.role === "A" ? pair.members.B : pair.members.A;
+    const partnerUid = resolvePartnerUid(user, pair);
+
     if (!partnerUid) {
-      return res.status(409).json({ erro: "A outra pessoa ainda não entrou no vínculo." });
+      return res.status(409).json({
+        erro: "A outra pessoa ainda não entrou no vínculo.",
+      });
     }
 
     const partner = await getUserRecord(partnerUid);
@@ -423,28 +557,208 @@ app.post("/send-miss", verifyAuth, async (req, res) => {
   }
 });
 
-app.post("/send", async (req, res) => {
+/**
+ * CARTA VIVA
+ */
+app.post("/send-letter", verifyAuth, async (req, res) => {
+  try {
+    const uid = req.uid;
+    const { pairId, type, style, intensity, text } = req.body || {};
+
+    if (!pairId || typeof pairId !== "string") {
+      return res.status(400).json({ erro: "pairId obrigatório." });
+    }
+
+    const validation = validateLetterPayload({
+      type,
+      style,
+      intensity,
+      text,
+    });
+
+    if (!validation.ok) {
+      return res.status(400).json({ erro: validation.erro });
+    }
+
+    const user = await resolveIdentity(uid);
+
+    if (user.pairId !== pairId) {
+      return res.status(403).json({
+        erro: "Acesso negado a esse vínculo.",
+      });
+    }
+
+    const pair = await getPairRecord(pairId);
+
+    if (!pair?.members) {
+      return res.status(400).json({ erro: "Vínculo inválido." });
+    }
+
+    const partnerUid = resolvePartnerUid(user, pair);
+
+    if (!partnerUid) {
+      return res.status(409).json({
+        erro: "A outra pessoa ainda não entrou no vínculo.",
+      });
+    }
+
+    const partner = await getUserRecord(partnerUid);
+
+    const nowIso = new Date().toISOString();
+
+    const letterPayload = {
+      id: randomLetterId(),
+      type: validation.type,
+      style: validation.style,
+      intensity: validation.intensity,
+      text: validation.text,
+      pairId,
+      senderId: uid,
+      senderRole: user.role,
+      createdAt: nowIso,
+      openedByPartner: false,
+      openedAt: null,
+      openedBy: null,
+    };
+
+    await db.ref(`pairs/${pairId}/letters/current`).set(letterPayload);
+
+    let pushId = null;
+
+    if (partner?.fcmToken) {
+      pushId = await sendPushToToken({
+        token: partner.fcmToken,
+        title: letterPushTitle(validation.type),
+        body: letterPushBody(validation.intensity),
+        channelId: "spotlove_alerts",
+        data: {
+          type: "letter",
+          pairId,
+          senderId: uid,
+          senderRole: user.role,
+          letterId: letterPayload.id,
+          letterType: validation.type,
+          style: validation.style,
+          intensity: validation.intensity,
+          time: nowIso,
+        },
+      });
+    }
+
+    return res.json({
+      ok: true,
+      letter: letterPayload,
+      pushId,
+    });
+  } catch (e) {
+    console.error("❌ send-letter:", e.message);
+    return res.status(500).json({ erro: e.message });
+  }
+});
+
+/**
+ * ABRIR CARTA
+ * Rota opcional mais segura do que atualizar openedByPartner direto pelo app.
+ * Seu Flutter atual ainda atualiza direto no Realtime Database.
+ * Se quiser, depois eu te passo o ajuste da CartaVivaScreen para usar essa rota.
+ */
+app.post("/open-letter", verifyAuth, async (req, res) => {
+  try {
+    const uid = req.uid;
+    const { pairId, letterId } = req.body || {};
+
+    if (!pairId || typeof pairId !== "string") {
+      return res.status(400).json({ erro: "pairId obrigatório." });
+    }
+
+    const user = await resolveIdentity(uid);
+
+    if (user.pairId !== pairId) {
+      return res.status(403).json({
+        erro: "Acesso negado a esse vínculo.",
+      });
+    }
+
+    const pair = await getPairRecord(pairId);
+
+    if (!pair?.members) {
+      return res.status(400).json({ erro: "Vínculo inválido." });
+    }
+
+    const letterSnap = await db.ref(`pairs/${pairId}/letters/current`).get();
+
+    if (!letterSnap.exists()) {
+      return res.status(404).json({ erro: "Nenhuma carta ativa encontrada." });
+    }
+
+    const letter = letterSnap.val();
+
+    if (letterId && letter.id !== letterId) {
+      return res.status(409).json({
+        erro: "Essa carta não é mais a carta atual.",
+      });
+    }
+
+    if (letter.senderId === uid) {
+      return res.status(403).json({
+        erro: "O remetente não pode marcar a própria carta como aberta pelo parceiro.",
+      });
+    }
+
+    const nowIso = new Date().toISOString();
+
+    await db.ref(`pairs/${pairId}/letters/current`).update({
+      openedByPartner: true,
+      openedAt: nowIso,
+      openedBy: uid,
+    });
+
+    return res.json({
+      ok: true,
+      openedAt: nowIso,
+    });
+  } catch (e) {
+    console.error("❌ open-letter:", e.message);
+    return res.status(500).json({ erro: e.message });
+  }
+});
+
+/**
+ * ENVIO DE PUSH MANUAL
+ * Use só para teste. Está protegido com token Firebase.
+ */
+app.post("/send", verifyAuth, async (req, res) => {
   try {
     const { token, title, body, data } = req.body || {};
 
     const r = await sendPushToToken({
       token,
-      title: title || "Novo áudio 🎤",
+      title: title || "Novo aviso 💗",
       body: body || "Tem algo novo",
       channelId: "spotlove_alerts",
       data: data || {},
     });
 
-    res.json({ ok: true, r });
+    return res.json({
+      ok: true,
+      r,
+    });
   } catch (e) {
-    res.status(500).json({ erro: e.message });
+    return res.status(500).json({ erro: e.message });
   }
 });
 
+/**
+ * UPLOAD DO ÁUDIO DO STUDIO
+ */
 app.post("/upload-audio", verifyAuth, upload.single("audio"), async (req, res) => {
   let tempFile = null;
 
   try {
+    if (!cloudinaryReady) {
+      return res.status(500).json({ erro: "Cloudinary não inicializado." });
+    }
+
     const uid = req.uid;
     const { pairId } = req.body || {};
 
@@ -459,16 +773,20 @@ app.post("/upload-audio", verifyAuth, upload.single("audio"), async (req, res) =
     tempFile = req.file.path;
 
     const user = await resolveIdentity(uid);
+
     if (user.pairId !== pairId) {
-      return res.status(403).json({ erro: "Acesso negado a esse vínculo." });
+      return res.status(403).json({
+        erro: "Acesso negado a esse vínculo.",
+      });
     }
 
     const pair = await getPairRecord(pairId);
+
     if (!pair?.members) {
       return res.status(400).json({ erro: "Vínculo inválido." });
     }
 
-    const partnerUid = user.role === "A" ? pair.members.B : pair.members.A;
+    const partnerUid = resolvePartnerUid(user, pair);
     const partner = partnerUid ? await getUserRecord(partnerUid) : null;
 
     const result = await cloudinary.uploader.upload(tempFile, {
@@ -517,9 +835,11 @@ app.post("/upload-audio", verifyAuth, upload.single("audio"), async (req, res) =
     });
   } catch (e) {
     console.error("❌ upload erro:", e.message);
-    res.status(500).json({ erro: e.message });
+    return res.status(500).json({ erro: e.message });
   } finally {
-    if (tempFile) fs.unlink(tempFile, () => {});
+    if (tempFile) {
+      fs.unlink(tempFile, () => {});
+    }
   }
 });
 
