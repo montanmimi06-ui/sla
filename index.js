@@ -2,17 +2,23 @@ const express = require("express");
 const admin = require("firebase-admin");
 const multer = require("multer");
 const fs = require("fs");
+const crypto = require("crypto");
 const { v2: cloudinary } = require("cloudinary");
 
 const app = express();
 
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 
 fs.mkdirSync("tmp", { recursive: true });
 
-const upload = multer({
+const audioUpload = multer({
   dest: "tmp/",
   limits: { fileSize: 15 * 1024 * 1024 },
+});
+
+const apkUpload = multer({
+  dest: "tmp/",
+  limits: { fileSize: 250 * 1024 * 1024 },
 });
 
 let firebaseReady = false;
@@ -28,6 +34,7 @@ try {
       private_key: raw.private_key.replace(/\\n/g, "\n"),
     }),
     databaseURL: process.env.FIREBASE_DATABASE_URL,
+    storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
   });
 
   db = admin.database();
@@ -285,7 +292,7 @@ function letterPushBody(intensity) {
 }
 
 /**
- * ADMIN — PUBLICAR NOVA VERSÃO DO APP
+ * ADMIN — PUBLICAR CONFIGURAÇÃO DE VERSÃO MANUALMENTE
  */
 app.post("/admin/app-version", verifyAdminSecret, async (req, res) => {
   try {
@@ -345,6 +352,110 @@ app.post("/admin/app-version", verifyAdminSecret, async (req, res) => {
     });
   }
 });
+
+/**
+ * ADMIN — UPLOAD AUTOMÁTICO DO APK + ATUALIZAÇÃO DO FIREBASE
+ */
+app.post(
+  "/admin/upload-apk-release",
+  verifyAdminSecret,
+  apkUpload.single("apk"),
+  async (req, res) => {
+    let tempFile = null;
+
+    try {
+      if (!requireFirebase(res)) return;
+
+      if (!process.env.FIREBASE_STORAGE_BUCKET) {
+        return res.status(500).json({
+          erro: "FIREBASE_STORAGE_BUCKET não configurado.",
+        });
+      }
+
+      if (!req.file) {
+        return res.status(400).json({
+          erro: "Arquivo APK obrigatório.",
+        });
+      }
+
+      const {
+        latestVersion,
+        minRequiredVersion,
+        title,
+        message,
+        forceUpdate,
+      } = req.body || {};
+
+      if (!latestVersion || typeof latestVersion !== "string") {
+        return res.status(400).json({
+          erro: "latestVersion obrigatório.",
+        });
+      }
+
+      tempFile = req.file.path;
+
+      const bucket = admin.storage().bucket();
+      const cleanVersion = latestVersion.trim();
+      const token = crypto.randomUUID();
+
+      const destination = `releases/android/spotlove-${cleanVersion}-${Date.now()}.apk`;
+
+      await bucket.upload(tempFile, {
+        destination,
+        metadata: {
+          contentType: "application/vnd.android.package-archive",
+          metadata: {
+            firebaseStorageDownloadTokens: token,
+          },
+        },
+      });
+
+      const encodedPath = encodeURIComponent(destination);
+
+      const updateUrl =
+        `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodedPath}` +
+        `?alt=media&token=${token}`;
+
+      const payload = {
+        latestVersion: cleanVersion,
+        minRequiredVersion:
+          typeof minRequiredVersion === "string" && minRequiredVersion.trim()
+            ? minRequiredVersion.trim()
+            : "1.0.0",
+        updateUrl,
+        title:
+          typeof title === "string" && title.trim()
+            ? title.trim()
+            : "Nova versão disponível 💗",
+        message:
+          typeof message === "string" && message.trim()
+            ? message.trim()
+            : `A versão ${cleanVersion} do SpotLove está disponível.`,
+        forceUpdate: forceUpdate === "true" || forceUpdate === true,
+        updatedAt: new Date().toISOString(),
+      };
+
+      await db.ref("appConfig/android").update(payload);
+
+      return res.json({
+        ok: true,
+        apkPath: destination,
+        updateUrl,
+        appConfig: payload,
+      });
+    } catch (e) {
+      console.error("❌ upload-apk-release:", e.message);
+
+      return res.status(500).json({
+        erro: e.message,
+      });
+    } finally {
+      if (tempFile) {
+        fs.unlink(tempFile, () => {});
+      }
+    }
+  }
+);
 
 /**
  * CRIAR VÍNCULO
@@ -879,108 +990,113 @@ app.post("/send", verifyAuth, async (req, res) => {
 /**
  * UPLOAD DO ÁUDIO DO STUDIO
  */
-app.post("/upload-audio", verifyAuth, upload.single("audio"), async (req, res) => {
-  let tempFile = null;
+app.post(
+  "/upload-audio",
+  verifyAuth,
+  audioUpload.single("audio"),
+  async (req, res) => {
+    let tempFile = null;
 
-  try {
-    if (!cloudinaryReady) {
+    try {
+      if (!cloudinaryReady) {
+        return res.status(500).json({
+          erro: "Cloudinary não inicializado.",
+        });
+      }
+
+      const uid = req.uid;
+      const { pairId } = req.body || {};
+
+      if (!req.file) {
+        return res.status(400).json({
+          erro: "Sem arquivo.",
+        });
+      }
+
+      if (!pairId) {
+        return res.status(400).json({
+          erro: "pairId obrigatório.",
+        });
+      }
+
+      tempFile = req.file.path;
+
+      const user = await resolveIdentity(uid);
+
+      if (user.pairId !== pairId) {
+        return res.status(403).json({
+          erro: "Acesso negado a esse vínculo.",
+        });
+      }
+
+      const pair = await getPairRecord(pairId);
+
+      if (!pair?.members) {
+        return res.status(400).json({
+          erro: "Vínculo inválido.",
+        });
+      }
+
+      const partnerUid = resolvePartnerUid(user, pair);
+      const partner = partnerUid ? await getUserRecord(partnerUid) : null;
+
+      const result = await cloudinary.uploader.upload(tempFile, {
+        resource_type: "auto",
+        folder: `studio_audio/${pairId}`,
+        public_id: "current_audio",
+        overwrite: true,
+        invalidate: true,
+        format: "mp3",
+        audio_codec: "mp3",
+        quality: "auto",
+      });
+
+      const finalUrl = result.secure_url + "?v=" + Date.now();
+      const nowIso = new Date().toISOString();
+
+      await db.ref(`pairs/${pairId}/studio/current`).set({
+        url: finalUrl,
+        senderId: uid,
+        senderRole: user.role,
+        time: nowIso,
+      });
+
+      await db.ref(`pairs/${pairId}/studio/recording`).remove();
+
+      if (partner?.fcmToken) {
+        await sendPushToToken({
+          token: partner.fcmToken,
+          title: "Novo áudio 🎤",
+          body: "Tem algo novo no estúdio.",
+          channelId: "spotlove_alerts",
+          data: {
+            type: "studio_audio",
+            pairId,
+            senderId: uid,
+            senderRole: user.role,
+            time: nowIso,
+            url: finalUrl,
+          },
+        });
+      }
+
+      return res.json({
+        ok: true,
+        audioUrl: finalUrl,
+      });
+    } catch (e) {
+      console.error("❌ upload erro:", e.message);
+
       return res.status(500).json({
-        erro: "Cloudinary não inicializado.",
+        erro: e.message,
       });
-    }
-
-    const uid = req.uid;
-    const { pairId } = req.body || {};
-
-    if (!req.file) {
-      return res.status(400).json({
-        erro: "Sem arquivo.",
-      });
-    }
-
-    if (!pairId) {
-      return res.status(400).json({
-        erro: "pairId obrigatório.",
-      });
-    }
-
-    tempFile = req.file.path;
-
-    const user = await resolveIdentity(uid);
-
-    if (user.pairId !== pairId) {
-      return res.status(403).json({
-        erro: "Acesso negado a esse vínculo.",
-      });
-    }
-
-    const pair = await getPairRecord(pairId);
-
-    if (!pair?.members) {
-      return res.status(400).json({
-        erro: "Vínculo inválido.",
-      });
-    }
-
-    const partnerUid = resolvePartnerUid(user, pair);
-    const partner = partnerUid ? await getUserRecord(partnerUid) : null;
-
-    const result = await cloudinary.uploader.upload(tempFile, {
-      resource_type: "auto",
-      folder: `studio_audio/${pairId}`,
-      public_id: "current_audio",
-      overwrite: true,
-      invalidate: true,
-      format: "mp3",
-      audio_codec: "mp3",
-      quality: "auto",
-    });
-
-    const finalUrl = result.secure_url + "?v=" + Date.now();
-    const nowIso = new Date().toISOString();
-
-    await db.ref(`pairs/${pairId}/studio/current`).set({
-      url: finalUrl,
-      senderId: uid,
-      senderRole: user.role,
-      time: nowIso,
-    });
-
-    await db.ref(`pairs/${pairId}/studio/recording`).remove();
-
-    if (partner?.fcmToken) {
-      await sendPushToToken({
-        token: partner.fcmToken,
-        title: "Novo áudio 🎤",
-        body: "Tem algo novo no estúdio.",
-        channelId: "spotlove_alerts",
-        data: {
-          type: "studio_audio",
-          pairId,
-          senderId: uid,
-          senderRole: user.role,
-          time: nowIso,
-          url: finalUrl,
-        },
-      });
-    }
-
-    return res.json({
-      ok: true,
-      audioUrl: finalUrl,
-    });
-  } catch (e) {
-    console.error("❌ upload erro:", e.message);
-
-    return res.status(500).json({
-      erro: e.message,
-    });
-  } finally {
-    if (tempFile) {
-      fs.unlink(tempFile, () => {});
+    } finally {
+      if (tempFile) {
+        fs.unlink(tempFile, () => {});
+      }
     }
   }
-});
+);
 
 app.listen(process.env.PORT || 3000, () => {
   console.log("🚀 server rodando");
