@@ -999,6 +999,438 @@ app.post(
   }
 );
 
+function randomBobisseId(prefix) {
+  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function cleanBobisseText(value, max = 900) {
+  return String(value || '').trim().slice(0, max);
+}
+
+function safeBobisseType(value, allowed, fallback = 'text') {
+  return allowed.includes(value) ? value : fallback;
+}
+
+function randomDelayMs(minHours, maxHours) {
+  const min = minHours * 60 * 60 * 1000;
+  const max = maxHours * 60 * 60 * 1000;
+  return min + Math.floor(Math.random() * (max - min + 1));
+}
+
+async function assertPairAccess(uid, pairId) {
+  if (!pairId || typeof pairId !== 'string') {
+    const err = new Error('pairId obrigatório.');
+    err.status = 400;
+    throw err;
+  }
+
+  const user = await resolveIdentity(uid);
+  if (user.pairId !== pairId) {
+    const err = new Error('Acesso negado a esse vínculo.');
+    err.status = 403;
+    throw err;
+  }
+
+  const pair = await getPairRecord(pairId);
+  if (!pair?.members) {
+    const err = new Error('Vínculo inválido.');
+    err.status = 400;
+    throw err;
+  }
+
+  const partnerUid = resolvePartnerUid(user, pair);
+  if (!partnerUid) {
+    const err = new Error('A outra pessoa ainda não entrou no vínculo.');
+    err.status = 409;
+    throw err;
+  }
+
+  return { user, pair, partnerUid, partner: await getUserRecord(partnerUid) };
+}
+
+async function bumpRain(pairId, stat, points = 1) {
+  const ref = db.ref(`pairs/${pairId}/rain`);
+  const now = Date.now();
+
+  await ref.transaction((current) => {
+    const rain = current && typeof current === 'object' ? current : {};
+    const stats = rain.stats && typeof rain.stats === 'object' ? rain.stats : {};
+
+    rain.points = Number(rain.points || 0) + points;
+    rain.lastDropAt = now;
+    stats[stat] = Number(stats[stat] || 0) + 1;
+    rain.stats = stats;
+
+    return rain;
+  });
+}
+
+async function pushToPartner(partner, title, body, data) {
+  if (!partner?.fcmToken) return null;
+  return sendPushToToken({
+    token: partner.fcmToken,
+    title,
+    body,
+    channelId: 'spotlove_alerts',
+    data,
+  });
+}
+
+/**
+ * ❤️ PERGUNTAS — CRIAR
+ * body: { pairId, title, questions: [string] }
+ */
+app.post('/bobisses/asks/create', verifyAuth, async (req, res) => {
+  try {
+    if (!requireFirebase(res)) return;
+
+    const uid = req.uid;
+    const { pairId, title, questions } = req.body || {};
+    const { partnerUid, partner } = await assertPairAccess(uid, pairId);
+
+    const cleanQuestions = Array.isArray(questions)
+      ? questions.map((q) => cleanBobisseText(q, 120)).filter(Boolean).slice(0, 15)
+      : [];
+
+    if (cleanQuestions.length < 1) {
+      return res.status(400).json({ erro: 'Crie pelo menos uma pergunta.' });
+    }
+
+    const now = Date.now();
+    const payload = {
+      creatorUid: uid,
+      targetUid: partnerUid,
+      title: cleanBobisseText(title, 48) || 'Perguntas do Be',
+      createdAt: now,
+      answered: false,
+      questions: cleanQuestions.map((text) => ({ text, answer: null })),
+    };
+
+    await db.ref(`pairs/${pairId}/asks/current`).set(payload);
+
+    const pushId = await pushToPartner(
+      partner,
+      '❤️ Be deixou perguntas para você.',
+      'Deslize para responder quando quiser.',
+      { type: 'bobisses_asks', pairId, createdAt: now }
+    );
+
+    return res.json({ ok: true, ask: payload, pushId });
+  } catch (e) {
+    console.error('❌ bobisses/asks/create:', e.message);
+    return res.status(e.status || 500).json({ erro: e.message });
+  }
+});
+
+/**
+ * ❤️ PERGUNTAS — RESPONDER
+ * body: { pairId, answers: [boolean] }
+ */
+app.post('/bobisses/asks/answer', verifyAuth, async (req, res) => {
+  try {
+    if (!requireFirebase(res)) return;
+
+    const uid = req.uid;
+    const { pairId, answers } = req.body || {};
+    await assertPairAccess(uid, pairId);
+
+    const snap = await db.ref(`pairs/${pairId}/asks/current`).get();
+    if (!snap.exists()) {
+      return res.status(404).json({ erro: 'Nenhuma pergunta ativa encontrada.' });
+    }
+
+    const ask = snap.val();
+    if (ask.targetUid !== uid) {
+      return res.status(403).json({ erro: 'Essas perguntas foram deixadas para a outra pessoa.' });
+    }
+
+    if (!Array.isArray(answers) || answers.length !== ask.questions.length) {
+      return res.status(400).json({ erro: 'Respostas incompletas.' });
+    }
+
+    const now = Date.now();
+    const answeredAsk = {
+      ...ask,
+      answered: true,
+      answeredAt: now,
+      questions: ask.questions.map((q, i) => ({
+        ...q,
+        answer: answers[i] === true,
+      })),
+    };
+
+    const historyRef = db.ref(`pairs/${pairId}/asks/history`).push();
+    const updates = {};
+    updates[`pairs/${pairId}/asks/history/${historyRef.key}`] = answeredAsk;
+    updates[`pairs/${pairId}/asks/current`] = null;
+    await db.ref().update(updates);
+    await bumpRain(pairId, 'asks', 2);
+
+    const creator = await getUserRecord(ask.creatorUid);
+    const pushId = await pushToPartner(
+      creator,
+      '❤️ Mô respondeu suas perguntas.',
+      'O resultado está esperando por você.',
+      { type: 'bobisses_asks_answered', pairId, historyId: historyRef.key, answeredAt: now }
+    );
+
+    return res.json({ ok: true, historyId: historyRef.key, pushId });
+  } catch (e) {
+    console.error('❌ bobisses/asks/answer:', e.message);
+    return res.status(e.status || 500).json({ erro: e.message });
+  }
+});
+
+/**
+ * 🛏️ TRAVESSEIRO — DEIXAR ALGO
+ * body: { pairId, type: text|image|sticker|audio, content }
+ */
+app.post('/bobisses/pillow/create', verifyAuth, async (req, res) => {
+  try {
+    if (!requireFirebase(res)) return;
+
+    const uid = req.uid;
+    const { pairId, type, content } = req.body || {};
+    const { partnerUid } = await assertPairAccess(uid, pairId);
+
+    const clean = cleanBobisseText(content, 900);
+    if (!clean) return res.status(400).json({ erro: 'Conteúdo obrigatório.' });
+
+    const now = Date.now();
+    const payload = {
+      senderUid: uid,
+      receiverUid: partnerUid,
+      type: safeBobisseType(type, ['text', 'image', 'sticker', 'audio']),
+      content: clean,
+      createdAt: now,
+      opened: false,
+      notified: false,
+      notifyAfter: now + randomDelayMs(1, 8),
+    };
+
+    await db.ref(`pairs/${pairId}/pillow`).set(payload);
+    return res.json({ ok: true, pillow: { ...payload, content: undefined } });
+  } catch (e) {
+    console.error('❌ bobisses/pillow/create:', e.message);
+    return res.status(e.status || 500).json({ erro: e.message });
+  }
+});
+
+/**
+ * 🛏️ TRAVESSEIRO — ABRIR E SUMIR
+ * body: { pairId }
+ */
+app.post('/bobisses/pillow/open', verifyAuth, async (req, res) => {
+  try {
+    if (!requireFirebase(res)) return;
+
+    const uid = req.uid;
+    const { pairId } = req.body || {};
+    await assertPairAccess(uid, pairId);
+
+    const ref = db.ref(`pairs/${pairId}/pillow`);
+    const snap = await ref.get();
+    if (!snap.exists()) return res.status(404).json({ erro: 'Nada encontrado.' });
+
+    const item = snap.val();
+    if (item.senderUid === uid) {
+      return res.status(403).json({ erro: 'Quem deixou não consegue rever.' });
+    }
+    if (item.receiverUid !== uid) {
+      return res.status(403).json({ erro: 'Esse item não foi deixado para você.' });
+    }
+
+    await ref.remove();
+    await bumpRain(pairId, 'pillow', 1);
+
+    return res.json({ ok: true, item });
+  } catch (e) {
+    console.error('❌ bobisses/pillow/open:', e.message);
+    return res.status(e.status || 500).json({ erro: e.message });
+  }
+});
+
+/**
+ * 🛏️ TRAVESSEIRO — NOTIFICAÇÃO NÃO INSTANTÂNEA
+ */
+app.post('/bobisses/pillow/dispatch', verifyAdminSecret, async (req, res) => {
+  try {
+    if (!requireFirebase(res)) return;
+
+    const now = Date.now();
+    const pairsSnap = await db.ref('pairs').get();
+    const sent = [];
+
+    if (!pairsSnap.exists()) return res.json({ ok: true, sent });
+
+    const pairs = pairsSnap.val();
+    for (const [pairId, pair] of Object.entries(pairs)) {
+      const pillow = pair?.pillow;
+      if (!pillow || pillow.opened || pillow.notified) continue;
+      if (Number(pillow.notifyAfter || 0) > now) continue;
+
+      const receiver = await getUserRecord(pillow.receiverUid);
+      const pushId = await pushToPartner(
+        receiver,
+        '🛏️ Há algo debaixo do travesseiro.',
+        'Talvez valha levantar com cuidado.',
+        { type: 'bobisses_pillow', pairId }
+      );
+
+      await db.ref(`pairs/${pairId}/pillow`).update({
+        notified: true,
+        notifiedAt: now,
+      });
+
+      sent.push({ pairId, pushId });
+    }
+
+    return res.json({ ok: true, sent });
+  } catch (e) {
+    console.error('❌ bobisses/pillow/dispatch:', e.message);
+    return res.status(500).json({ erro: e.message });
+  }
+});
+
+/**
+ * 📻 RÁDIO — CRIAR TRANSMISSÃO
+ * body: { pairId, type: text|audio, content }
+ */
+app.post('/bobisses/radio/create', verifyAuth, async (req, res) => {
+  try {
+    if (!requireFirebase(res)) return;
+
+    const uid = req.uid;
+    const { pairId, type, content } = req.body || {};
+    const { partnerUid } = await assertPairAccess(uid, pairId);
+
+    const clean = cleanBobisseText(content, 900);
+    if (!clean) return res.status(400).json({ erro: 'Conteúdo obrigatório.' });
+
+    const now = Date.now();
+    const payload = {
+      senderUid: uid,
+      receiverUid: partnerUid,
+      type: safeBobisseType(type, ['text', 'audio']),
+      content: clean,
+      createdAt: now,
+      deliverAfter: now + randomDelayMs(6, 72),
+      delivered: false,
+      opened: false,
+    };
+
+    const ref = db.ref(`pairs/${pairId}/radio`).push();
+    await ref.set(payload);
+
+    return res.json({ ok: true, radioId: ref.key, deliverAfter: payload.deliverAfter });
+  } catch (e) {
+    console.error('❌ bobisses/radio/create:', e.message);
+    return res.status(e.status || 500).json({ erro: e.message });
+  }
+});
+
+/**
+ * 📻 RÁDIO — ABRIR TRANSMISSÃO
+ * body: { pairId, radioId }
+ */
+app.post('/bobisses/radio/open', verifyAuth, async (req, res) => {
+  try {
+    if (!requireFirebase(res)) return;
+
+    const uid = req.uid;
+    const { pairId, radioId } = req.body || {};
+    await assertPairAccess(uid, pairId);
+
+    if (!radioId) return res.status(400).json({ erro: 'radioId obrigatório.' });
+
+    const ref = db.ref(`pairs/${pairId}/radio/${radioId}`);
+    const snap = await ref.get();
+    if (!snap.exists()) return res.status(404).json({ erro: 'Transmissão não encontrada.' });
+
+    const radio = snap.val();
+    if (radio.receiverUid !== uid) {
+      return res.status(403).json({ erro: 'Essa transmissão não foi recebida por você.' });
+    }
+
+    const now = Date.now();
+    await ref.update({ opened: true, openedAt: now });
+    await bumpRain(pairId, 'radio', 1);
+
+    return res.json({ ok: true, openedAt: now });
+  } catch (e) {
+    console.error('❌ bobisses/radio/open:', e.message);
+    return res.status(e.status || 500).json({ erro: e.message });
+  }
+});
+
+/**
+ * 📻 RÁDIO — DISPATCH SCHEDULER
+ */
+app.post('/bobisses/radio/dispatch', verifyAdminSecret, async (req, res) => {
+  try {
+    if (!requireFirebase(res)) return;
+
+    const now = Date.now();
+    const pairsSnap = await db.ref('pairs').get();
+    const sent = [];
+
+    if (!pairsSnap.exists()) return res.json({ ok: true, sent });
+
+    const pairs = pairsSnap.val();
+    for (const [pairId, pair] of Object.entries(pairs)) {
+      const radio = pair?.radio;
+      if (!radio || typeof radio !== 'object') continue;
+
+      for (const [radioId, item] of Object.entries(radio)) {
+        if (!item || item.delivered || Number(item.deliverAfter || 0) > now) continue;
+
+        const receiver = await getUserRecord(item.receiverUid);
+        const pushId = await pushToPartner(
+          receiver,
+          '📻 Uma transmissão foi recebida.',
+          'A Rádio SpotLove encontrou uma frequência.',
+          { type: 'bobisses_radio', pairId, radioId }
+        );
+
+        await db.ref(`pairs/${pairId}/radio/${radioId}`).update({
+          delivered: true,
+          deliveredAt: now,
+          pushId: pushId || null,
+        });
+
+        sent.push({ pairId, radioId, pushId });
+      }
+    }
+
+    return res.json({ ok: true, sent });
+  } catch (e) {
+    console.error('❌ bobisses/radio/dispatch:', e.message);
+    return res.status(500).json({ erro: e.message });
+  }
+});
+
+/**
+ * ☔ CHUVA — INCREMENTO ADMINISTRATIVO/INTERNO
+ * body: { pairId, stat, points }
+ */
+app.post('/bobisses/rain/drop', verifyAdminSecret, async (req, res) => {
+  try {
+    if (!requireFirebase(res)) return;
+
+    const { pairId, stat, points } = req.body || {};
+    const allowed = ['saudades', 'radio', 'pillow', 'asks', 'letters', 'studio'];
+    if (!pairId || !allowed.includes(stat)) {
+      return res.status(400).json({ erro: 'pairId/stat inválidos.' });
+    }
+
+    await bumpRain(pairId, stat, Math.max(1, Number(points || 1)));
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('❌ bobisses/rain/drop:', e.message);
+    return res.status(500).json({ erro: e.message });
+  }
+});
+
 app.listen(process.env.PORT || 3000, () => {
   console.log("🚀 server rodando");
 });
